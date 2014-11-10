@@ -24,6 +24,7 @@ from requests import RequestException
 from lxml import etree
 import logging
 import sys
+import pprint
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
@@ -131,6 +132,9 @@ def generate_output(person_tree, redcap_client, rate_limit, data_repository, ski
     ideal_time_per_request = 60 / float(rate_limiter_value_in_redcap)
     time_stamp_after_request = 0
 
+    #used to collect the data for each person
+    all_person_data = []
+
     # main loop for each person
     for person in persons:
         time_begin = datetime.datetime.now()
@@ -146,11 +150,17 @@ def generate_output(person_tree, redcap_client, rate_limit, data_repository, ski
 
         forms = person.xpath('./all_form_events/form')
 
+        # container for all forms a person completes
+        person_form_data = []
+
         # loop through the forms of one person
         for form in forms:
             form_name = form.xpath('name')[0].text
             form_key = 'Total_' + form_name + '_Forms'
             study_id_key = study_id.text
+
+            # container for all events in the form
+            form_event_data = []
 
             # init dictionary for a new person in (study_id)
             if study_id_key not in subject_details:
@@ -190,52 +200,45 @@ def generate_output(person_tree, redcap_client, rate_limit, data_repository, ski
                     if skip_blanks and not contains_data:
                         break
 
-                    time_lapse_since_last_request = time.time(
-                    ) - time_stamp_after_request
-                    sleepTime = max(
-                        ideal_time_per_request -
-                        time_lapse_since_last_request,
-                        0)
-                    # print 'Sleep for: %s seconds' % sleepTime
-                    time.sleep(sleepTime)
-
-                    if (0 == event_count % 50):
-                        logger.info('Requests sent: %s' % (event_count))
-
                     # to speedup testing uncomment the following line
                     # if (0 == event_count % 2) : continue
 
-                    try:
-                        found_error = False
-                        response = redcap_client.send_data_to_redcap([json_data_dict], overwrite = True)
-                        status = event.find('status')
-                        if status is not None:
-                            status.text = 'sent'
-                        else:
-                            status_element = etree.Element("status")
-                            status_element.text = 'sent'
-                            event.append(status_element)
-                        data_repository.store(person_tree)
-                    except RedcapError as e:
-                        found_error = handle_errors_in_redcap_xml_response(
-                            e.message,
-                            report_data)
+                    #adding event data to form container
+                    form_event_data.append(json_data_dict)
 
-                    time_stamp_after_request = time.time()
+                    #TODO fix this total lie; these are not sent, only processed!
+                    status = event.find('status')
+                    if status is not None:
+                        status.text = 'sent'
+                    else:
+                        status_element = etree.Element("status")
+                        status_element.text = 'sent'
+                        event.append(status_element)
+                    data_repository.store(person_tree)
 
                     if contains_data:
-                        if not found_error:
-                            # if no errors encountered update event counters
-                            subject_details[study_id_key][form_key] += 1
-                            form_details[form_key] += 1
+                        # if data exists, update counters
+                        subject_details[study_id_key][form_key] += 1
+                        form_details[form_key] += 1
 
                 except Exception as e:
                     logger.error(e.message)
                     raise
 
+            #adding form data to person container
+            person_form_data.append(form_event_data)
+
         time_end = datetime.datetime.now()
-        logger.info("Total execution time for study_id %s was %s" % (study_id_key, (time_end - time_begin)))
-        logger.info("Total REDCap requests sent: %s \n" % (event_count))
+        logger.info("Total execution time for processing study_id %s was %s" % (study_id_key, (time_end - time_begin)))
+        all_person_data.append(person_form_data)
+
+    cleaned_all_person_data = _clean_event_structure(all_person_data)
+
+    #saving all data with optimistic saving strategy
+    _save_output(cleaned_all_person_data, redcap_client, report_data)
+
+
+
 
     report_data.update({
         'total_subjects': person_count,
@@ -246,6 +249,71 @@ def generate_output(person_tree, redcap_client, rate_limit, data_repository, ski
 
     logger.debug('report_data ' + repr(report_data))
     return report_data
+
+def _clean_event_structure(data):
+    #container for data with events merged and forms removed
+    cleaned_data = []
+
+    for person in data:
+
+        #container for all events for a single person
+        person_events = []
+        for form in person:
+            for event in form:
+                person_events.append(event)
+
+        #container for all events for a single person with no duplicates
+        merged_events = []
+
+        for event_l in person_events:
+            for event_r in person_events:
+                #if the record id and event name are the same, treat them as the same event and combine them
+                if event_l != event_r and \
+                                event_l["record_id"] == event_r["record_id"] and \
+                                event_l["redcap_event_name"] == event_r["redcap_event_name"]:
+                    merged_event = dict(event_l.items() + event_r.items())
+
+                    if merged_event not in merged_events:
+                        merged_events.append(dict(event_l.items() + event_r.items()))
+
+        cleaned_data.append(merged_events)
+
+    return cleaned_data
+
+
+def _save_output(data, redcap_client, report_data):
+    start_time = datetime.datetime.now()
+    request_count = 0
+    # writing all data to redcap instance
+    try:
+        # flattening list
+        all_events = [event for person in data for event in person]
+        request_count += 1
+        response = redcap_client.send_data_to_redcap(all_events, overwrite=True)
+    except RedcapError as e:
+        logger.info("Can't send all at once, trying per person")
+        # uh oh, error somewhere in list; let's try per person
+        for person in data:
+            try:
+                all_person_events = person
+                request_count += 1
+                response = redcap_client.send_data_to_redcap(all_person_events, overwrite=True)
+            except RedcapError as e:
+                logger.info("Can't send all events at once for person, trying all events individually for this person")
+                #failed again!  Let's try per event now
+                for event in person:
+                    try:
+                        request_count += 1
+                        response = redcap_client.send_data_to_redcap([event], overwrite=True)
+                    except RedcapError as e:
+                        found_error = handle_errors_in_redcap_xml_response(e.message, report_data)
+
+
+    end_time = datetime.datetime.now()
+    logger.info("Total REDCap requests sent: %s \n" % request_count)
+    logger.info("Total time spent communicating with REDCap was %s" % (end_time - start_time))
+
+
 
 """
 handle_errors_in_redcap_xml_response:
